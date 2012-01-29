@@ -1033,7 +1033,7 @@ g_vfs_afp_server_login (GVfsAfpServer *server,
 try_login:
 
     /* Open connection */
-    res = g_vfs_afp_connection_open (server->conn, cancellable, &err);
+    res = g_vfs_afp_connection_open_sync (server->conn, cancellable, &err);
     if (!res)
       break;
 
@@ -1041,7 +1041,7 @@ try_login:
                     cancellable, &err);
     if (!res)
     {
-      g_vfs_afp_connection_close (server->conn, cancellable, NULL);
+      g_vfs_afp_connection_close_sync (server->conn, cancellable, NULL);
 
       if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED))
         break;
