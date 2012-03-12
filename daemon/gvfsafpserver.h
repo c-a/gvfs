@@ -40,6 +40,16 @@ typedef enum
   AFP_VERSION_3_3
 } AfpVersion;
 
+typedef struct
+{
+  guint16             flags;
+  char                *machine_type;
+  char                *server_name;
+  char                *utf8_server_name;
+  GSList              *uams;
+  AfpVersion          version;
+} GVfsAfpServerInfo;
+
 #define G_VFS_TYPE_AFP_SERVER             (g_vfs_afp_server_get_type ())
 #define G_VFS_AFP_SERVER(obj)             (G_TYPE_CHECK_INSTANCE_CAST ((obj), G_VFS_TYPE_AFP_SERVER, GVfsAfpServer))
 #define G_VFS_AFP_SERVER_CLASS(klass)     (G_TYPE_CHECK_CLASS_CAST ((klass), G_VFS_TYPE_AFP_SERVER, GVfsAfpServerClass))
@@ -49,6 +59,7 @@ typedef enum
 
 typedef struct _GVfsAfpServerClass GVfsAfpServerClass;
 typedef struct _GVfsAfpServer GVfsAfpServer;
+typedef struct _GvfsAfpServerPrivate GVfsAfpServerPrivate;
 
 struct _GVfsAfpServerClass
 {
@@ -59,27 +70,14 @@ struct _GVfsAfpServer
 {
   GObject parent_instance;
 
-  GNetworkAddress     *addr;
-  GVfsAfpConnection   *conn;
-
-  guint16             flags;
-  char                *machine_type;
-  char                *server_name;
-  char                *utf8_server_name;
-  GSList              *uams;
-  AfpVersion          version;
-
-  gint32              time_diff;
-
-  guint32             user_id;
-  guint32             group_id;
+  GVfsAfpServerPrivate *priv;
 };
 
 GType              g_vfs_afp_server_get_type             (void) G_GNUC_CONST;
 
 GVfsAfpServer*     g_vfs_afp_server_new                  (GNetworkAddress *addr);
 
-gboolean           g_vfs_afp_server_login                (GVfsAfpServer *afp_serv,
+gboolean           g_vfs_afp_server_login                (GVfsAfpServer *server,
                                                           const char     *initial_user,
                                                           GMountSource   *mount_source,
                                                           char           **logged_in_user,
@@ -90,8 +88,11 @@ gboolean           g_vfs_afp_server_logout_sync          (GVfsAfpServer *server,
                                                           GCancellable  *cancellable,
                                                           GError       **error);
 
-gint64             g_vfs_afp_server_time_to_local_time   (GVfsAfpServer *afp_serv,
+gint64             g_vfs_afp_server_time_to_local_time   (GVfsAfpServer *server,
                                                           gint32         server_time);
+
+const
+GVfsAfpServerInfo* g_vfs_afp_server_get_info             (GVfsAfpServer *server);
 
 typedef struct _GVfsAfpVolumeData GVfsAfpVolumeData;
 struct _GVfsAfpVolumeData
