@@ -174,7 +174,10 @@ struct _GVfsBackendSftp
   
   /* Reply reading: */
   GHashTable *expected_replies;
+  char reply_buf[9];
   guint32 reply_size;
+  guint8  reply_type;
+  guint32 reply_id;
   guint32 reply_size_read;
   guint8 *reply;
   
@@ -1171,6 +1174,32 @@ check_input_stream_read_result (GVfsBackendSftp *backend, gssize res, GError *er
 static void read_reply_async (GVfsBackendSftp *backend);
 
 static void
+read_reply_async_skip  (GObject *source_object,
+                        GAsyncResult *result,
+                        gpointer user_data)
+{
+  GVfsBackendSftp *backend = user_data;
+  gssize res;
+  GError *error = NULL;
+
+  res = g_input_stream_skip_finish (G_INPUT_STREAM (source_object), result, &error);
+
+  check_input_stream_read_result (backend, res, error);
+
+  backend->reply_size_read += res;
+  
+  if (backend->reply_size_read < backend->reply_size)
+    {
+      g_input_stream_skip_async (backend->reply_stream,
+        backend->reply_size - backend->reply_size_read, 0, NULL,
+        read_reply_async_skip, backend);
+      return;
+    }
+
+  read_reply_async (backend);
+}
+
+static void
 read_reply_async_got_data  (GObject *source_object,
                             GAsyncResult *result,
                             gpointer user_data)
@@ -1179,8 +1208,6 @@ read_reply_async_got_data  (GObject *source_object,
   gssize res;
   GDataInputStream *reply;
   ExpectedReply *expected_reply;
-  guint32 id;
-  int type;
   GError *error;
 
   error = NULL;
@@ -1201,34 +1228,31 @@ read_reply_async_got_data  (GObject *source_object,
   reply = make_reply_stream (backend->reply, backend->reply_size);
   backend->reply = NULL;
 
-  type = g_data_input_stream_read_byte (reply, NULL, NULL);
-  id = g_data_input_stream_read_uint32 (reply, NULL, NULL);
-
-  expected_reply = g_hash_table_lookup (backend->expected_replies, GINT_TO_POINTER (id));
+  expected_reply = g_hash_table_lookup (backend->expected_replies, GINT_TO_POINTER (backend->reply_id));
   if (expected_reply)
     {
       if (expected_reply->callback != NULL)
-        (expected_reply->callback) (backend, type, reply, backend->reply_size,
+        (expected_reply->callback) (backend, backend->reply_type, reply, backend->reply_size,
                                     expected_reply->job, expected_reply->user_data);
-      g_hash_table_remove (backend->expected_replies, GINT_TO_POINTER (id));
+      g_hash_table_remove (backend->expected_replies, GINT_TO_POINTER (backend->reply_id));
     }
   else
-    g_warning ("Got unhandled reply of size %"G_GUINT32_FORMAT" for id %"G_GUINT32_FORMAT"\n", backend->reply_size, id);
+    g_warning ("Got unhandled reply of size %"G_GUINT32_FORMAT" for id %"G_GUINT32_FORMAT"\n", backend->reply_size, backend->reply_id);
 
   g_object_unref (reply);
 
   read_reply_async (backend);
-  
 }
 
 static void
-read_reply_async_got_len  (GObject *source_object,
+read_reply_async_got_hdr  (GObject *source_object,
                            GAsyncResult *result,
                            gpointer user_data)
 {
   GVfsBackendSftp *backend = user_data;
   gssize res;
   GError *error;
+  ExpectedReply *expected_reply;
 
   error = NULL;
   res = g_input_stream_read_finish (G_INPUT_STREAM (source_object), result, &error);
@@ -1244,21 +1268,38 @@ read_reply_async_got_len  (GObject *source_object,
 
   backend->reply_size_read += res;
 
-  if (backend->reply_size_read < 4)
+  if (backend->reply_size_read < 9)
     {
       g_input_stream_read_async (backend->reply_stream,
-				 &backend->reply_size + backend->reply_size_read, 4 - backend->reply_size_read,
-				 0, backend->reply_stream_cancellable, read_reply_async_got_len,
+				 backend->reply_buf + backend->reply_size_read, 9 - backend->reply_size_read,
+				 0, backend->reply_stream_cancellable, read_reply_async_got_hdr,
 				 backend);
       return;
     }
-  backend->reply_size = GUINT32_FROM_BE (backend->reply_size);
 
-  backend->reply_size_read = 0;
-  backend->reply = g_malloc (backend->reply_size);
-  g_input_stream_read_async (backend->reply_stream,
-			     backend->reply, backend->reply_size,
-			     0, NULL, read_reply_async_got_data, backend);
+  backend->reply_size = GUINT32_FROM_BE (*(guint32 *)backend->reply_buf);
+  /* We've already read the first 5 bytes of the packet*/
+  backend->reply_size -= 5;
+  
+  backend->reply_type = *(backend->reply_buf + 4);
+  backend->reply_id = GUINT32_FROM_BE (*(guint32 *)(backend->reply_buf + 5));
+
+  expected_reply = g_hash_table_lookup (backend->expected_replies, GINT_TO_POINTER (backend->reply_id));
+  if (expected_reply)
+    {
+      backend->reply_size_read = 0;
+      backend->reply = g_malloc (backend->reply_size);
+      g_input_stream_read_async (backend->reply_stream,
+                                 backend->reply, backend->reply_size,
+                                 0, NULL, read_reply_async_got_data, backend);
+    }
+  else
+    {
+      g_warning ("Got unhandled reply of size %"G_GUINT32_FORMAT" for id %"G_GUINT32_FORMAT"\n", backend->reply_size, backend->reply_id);
+      backend->reply_size_read = 0;
+      g_input_stream_skip_async (backend->reply_stream, backend->reply_size, 0,
+        NULL, read_reply_async_skip, backend);
+    }
 }
 
 static void
@@ -1266,9 +1307,9 @@ read_reply_async (GVfsBackendSftp *backend)
 {
   backend->reply_size_read = 0;
   g_input_stream_read_async (backend->reply_stream,
-                             &backend->reply_size, 4,
+                             backend->reply_buf, 9,
                              0, backend->reply_stream_cancellable,
-                             read_reply_async_got_len,
+                             read_reply_async_got_hdr,
                              backend);
 }
 
