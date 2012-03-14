@@ -88,6 +88,11 @@ typedef enum {
 
 typedef struct _MultiReply MultiReply;
 
+typedef void (*HeaderCallback) (GVfsBackendSftp *backend,
+                                int reply_type,
+                                guint32 len,
+                                gpointer user_data);
+
 typedef void (*ReplyCallback) (GVfsBackendSftp *backend,
                                int reply_type,
                                GDataInputStream *reply,
@@ -104,7 +109,7 @@ typedef void (*MultiReplyCallback) (GVfsBackendSftp *backend,
 
 typedef struct {
   MultiReply *replies;
-  int n_replies;
+  int n_replies
   int n_outstanding;
   gpointer user_data;
   MultiReplyCallback callback;
@@ -136,6 +141,7 @@ typedef struct {
 
 
 typedef struct {
+  HeaderCallback header_callback;
   ReplyCallback callback;
   GVfsJob *job;
   gpointer user_data;
@@ -1287,6 +1293,12 @@ read_reply_async_got_hdr  (GObject *source_object,
   expected_reply = g_hash_table_lookup (backend->expected_replies, GINT_TO_POINTER (backend->reply_id));
   if (expected_reply)
     {
+      if (expected_reply->header_callback)
+      {
+        expect_reply->header_callback (backend);
+        return;
+      }
+      
       backend->reply_size_read = 0;
       backend->reply = g_malloc (backend->reply_size);
       g_input_stream_read_async (backend->reply_stream,
@@ -1377,6 +1389,7 @@ send_command (GVfsBackendSftp *backend)
 static void
 expect_reply (GVfsBackendSftp *backend,
               guint32 id,
+              HeaderCallback header_callback,
               ReplyCallback callback,
               GVfsJob *job,
               gpointer user_data)
@@ -1384,6 +1397,7 @@ expect_reply (GVfsBackendSftp *backend,
   ExpectedReply *expected;
 
   expected = g_slice_new (ExpectedReply);
+  expected->header_callback = header_callback;
   expected->callback = callback;
   expected->job = g_object_ref (job);
   expected->user_data = user_data;
@@ -1420,6 +1434,7 @@ queue_command_buffer (GVfsBackendSftp *backend,
 static void
 queue_command_stream_and_free (GVfsBackendSftp *backend,
                                GDataOutputStream *command_stream,
+                               HeaderCallback header_callback,
                                ReplyCallback callback,
                                GVfsJob *job,
                                gpointer user_data)
@@ -2501,23 +2516,87 @@ read_reply (GVfsBackendSftp *backend,
             GVfsJob *job,
             gpointer user_data)
 {
+  if (reply_type == SSH_FXP_STATUS)
+    result_from_status (job, reply, -1, SSH_FX_EOF);
+  
+  else
+  {
+    g_vfs_job_failed (job, G_IO_ERROR, G_IO_ERROR_FAILED,
+                      _("Invalid reply received"));
+  }
+}
+
+static void
+read_reply_async_got_hdr  (GObject *source_object,
+                           GAsyncResult *result,
+                           gpointer user_data)
+{
+  GVfsJobRead *job = user_data;
+  GVfsBackendSftp *backend = G_VFS_BACKEND_SFTP (job->backend);
+
+  gssize res;
+  GError *error;
+  guint32 count;
+
+  error = NULL;
+  res = g_input_stream_read_finish (G_INPUT_STREAM (source_object), result, &error);
+
+  /* Bail out if cancelled */
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    {
+      g_object_unref (backend);
+      return;
+    }
+
+  check_input_stream_read_result (backend, res, error);
+
+  backend->reply_size_read += res;
+
+  if (backend->reply_size_read < 4)
+    {
+      g_input_stream_read_async (backend->reply_stream,
+        backend->reply_buf + backend->reply_size_read, 4 - backend->reply_size_read,
+        0, NULL, read_reply_async_got_hdr, job);
+      return;
+    }
+
+  count = GUINT32_FROM_BE (*(guint32 *)backend->reply_buf);
+  if (count > job->bytes_requested)
+  {
+    g_vfs_job_failed (job, G_IO_ERROR, G_IO_ERROR_FAILED,
+                      _("Invalid reply received"));
+    return TRUE;
+  }
+
+  backend->reply_size = count;
+  backend->reply_size_read = 0;
+}
+
+static gboolean
+read_got_header (GVfsBackendSftp *backend,
+                 int reply_type,
+                 guint32 len,
+                 GVfsJob *job,
+                 gpointer user_data)
+{
   SftpHandle *handle;
   guint32 count;
   
   handle = user_data;
-  
-  if (reply_type == SSH_FXP_STATUS)
-    {
-      result_from_status (job, reply, -1, SSH_FX_EOF);
-      return;
-    }
 
   if (reply_type != SSH_FXP_DATA)
-    {
-      g_vfs_job_failed (job, G_IO_ERROR, G_IO_ERROR_FAILED,
-                        _("Invalid reply received"));
-      return;
-    }
+    return FALSE;
+
+  if (len < 1)
+  {
+    g_vfs_job_failed (job, G_IO_ERROR, G_IO_ERROR_FAILED,
+                      _("Invalid reply received"));
+    return TRUE;
+  }
+
+  /* Read count */
+  g_input_stream_read_async (backend->reply_stream, backend->reply_buf, 4,
+                             0, NULL, read_got_count, job);
   
   count = g_data_input_stream_read_uint32 (reply, NULL, NULL);
 
